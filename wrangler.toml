@@ -1,6 +1,8 @@
 name = "m-recruits"
 main = "worker.js"
 compatibility_date = "2025-01-01"
+# Keep variables you add in the Cloudflare dashboard (for example GOOGLE_CLIENT_ID) when deploying from GitHub.
+keep_vars = true
 
 [assets]
 directory = "./public"
