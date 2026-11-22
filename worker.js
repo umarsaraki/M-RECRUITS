@@ -57,6 +57,32 @@ async function listJobs(url,env){
   env.DB.prepare(`SELECT COUNT(*) n FROM jobs WHERE ${W}`).bind(...p).first()]);
  return {jobs:rows.results,page,size,total:tot.n}}
 
+const MT={pdf:'application/pdf',png:'image/png',jpg:'image/jpeg',webp:'image/webp',docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document',doc:'application/msword'};
+async function sniff(file,allow){if(!(file instanceof File)||!file.size||file.size>5*1024*1024)return null;const g=hex(new Uint8Array(await file.slice(0,4).arrayBuffer()));
+ const e=g==='25504446'?'pdf':g==='89504e47'?'png':g.startsWith('ffd8ff')?'jpg':g==='52494646'?'webp':g==='504b0304'?'docx':g==='d0cf11e0'?'doc':null;return e&&allow.includes(e)&&MT[e]===file.type?e:null}
+async function cvSubmit(req,env){
+ if(!(await limit(env,'cv:'+ip(req),5,3600)))return fail('Too many submissions. Try later.',429);
+ if(+req.headers.get('content-length')>12*1024*1024)return fail('Request too large',413);
+ const f=await req.formData(),g=(k,m=300)=>s(f.get(k),m),errs={};
+ const pk=await env.DB.prepare('SELECT * FROM cv_packages WHERE id=? AND active=1').bind(parseInt(g('package_id'))||0).first();
+ if(!pk)errs.package_id='Choose a package';
+ const d={full_name:g('full_name'),email:g('email',254).toLowerCase(),phone:g('phone',30),location:g('location'),country:g('country',80),transaction_ref:g('transaction_ref',80),payment_date:g('payment_date',10),education:g('education',4000),experience:g('experience',4000)};
+ for(const k of['objective','summary','skills','certifications','languages','achievements','referees','additional_info'])d[k]=g(k,4000);
+ if(d.full_name.length<2)errs.full_name='Required';if(!emailOk(d.email))errs.email='Invalid email';if(!/^\+?[0-9 ()-]{7,20}$/.test(d.phone))errs.phone='Invalid phone';
+ for(const k of['location','transaction_ref','education','experience'])if(!d[k])errs[k]='Required';
+ if(!/^\d{4}-\d{2}-\d{2}$/.test(d.payment_date)||d.payment_date>new Date().toISOString().slice(0,10))errs.payment_date='Use a valid date, not in the future';
+ const amt=Math.round(Number(g('amount_paid',20)));if(!(amt>0))errs.amount_paid='Enter the amount you paid';
+ if(f.get('consent')!=='true')errs.consent='Consent is required';
+ const re=await sniff(f.get('receipt'),['pdf','png','jpg','webp']);if(!re)errs.receipt='Upload your payment receipt or screenshot (PDF, PNG, JPG or WebP, max 5 MB)';
+ let oe=null;if(pk?.kind==='revamp'){oe=await sniff(f.get('old_cv'),['pdf','doc','docx']);if(!oe)errs.old_cv='Upload your previous CV (PDF, DOC or DOCX, max 5 MB)'}
+ if(Object.keys(errs).length)return json({error:'Validation failed',fields:errs},422);
+ const reference=ref('CV'),rk=`private/cv-pay/${reference}-${rnd(6)}.${re}`,ok=oe?`private/cv-old/${reference}-${rnd(6)}.${oe}`:null;
+ await env.MEDIA_BUCKET.put(rk,f.get('receipt').stream(),{httpMetadata:{contentType:MT[re]}});
+ if(ok)await env.MEDIA_BUCKET.put(ok,f.get('old_cv').stream(),{httpMetadata:{contentType:MT[oe]}});
+ try{await env.DB.prepare('INSERT INTO cv_service_requests(reference,package_id,package_name,package_kind,package_price,currency,full_name,email,phone,location,country,objective,summary,education,experience,skills,certifications,languages,achievements,referees,additional_info,old_cv_key,amount_paid,payment_date,transaction_ref,receipt_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').bind(reference,pk.id,pk.name,pk.kind,pk.price,pk.currency,d.full_name,d.email,d.phone,d.location,d.country,d.objective,d.summary,d.education,d.experience,d.skills,d.certifications,d.languages,d.achievements,d.referees,d.additional_info,ok,amt,d.payment_date,d.transaction_ref,rk).run()}
+ catch(e){await env.MEDIA_BUCKET.delete(rk);if(ok)await env.MEDIA_BUCKET.delete(ok);return fail('Could not save your request. Please try again.',500)}
+ return json({reference},201)}
+
 async function submitApplication(req,env){
  if(!(await limit(env,'app:'+ip(req),5,3600)))return fail('Too many submissions. Try later.',429);
  if(+req.headers.get('content-length')>MAXB)return fail('Request too large',413);
@@ -109,7 +135,7 @@ async function simpleInsert(req,env,table,fields,prefix,extra){
 //   - new index / starter rows -> add to AFTER
 //   then increase SCHEMA_VERSION by 1 and deploy. It applies by itself.
 // ======================================================================
-const SCHEMA_VERSION=3;
+const SCHEMA_VERSION=5;
 
 // ---------------------------- TABLES ----------------------------------
 const TABLES=[
@@ -327,6 +353,139 @@ const TABLES=[
     w INTEGER NOT NULL,
     c INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(k,w)
+  )`,
+  `CREATE TABLE IF NOT EXISTS cv_packages(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN('new','revamp')),
+    price INTEGER NOT NULL CHECK(price>=0),
+    currency TEXT NOT NULL DEFAULT 'NGN',
+    description TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    sort_order INTEGER NOT NULL DEFAULT 0
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS payment_accounts(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bank_name TEXT NOT NULL,
+    account_name TEXT NOT NULL,
+    account_number TEXT NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'NGN',
+    instructions TEXT,
+    active INTEGER NOT NULL DEFAULT 1
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS cv_service_requests(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reference TEXT NOT NULL UNIQUE,
+    package_id INTEGER NOT NULL REFERENCES cv_packages(id),
+    package_name TEXT NOT NULL,
+    package_kind TEXT NOT NULL,
+    package_price INTEGER NOT NULL,
+    currency TEXT NOT NULL,
+    full_name TEXT NOT NULL,
+    email TEXT NOT NULL,
+    phone TEXT NOT NULL,
+    location TEXT NOT NULL,
+    country TEXT,
+    objective TEXT,
+    summary TEXT,
+    education TEXT,
+    experience TEXT,
+    skills TEXT,
+    certifications TEXT,
+    languages TEXT,
+    achievements TEXT,
+    referees TEXT,
+    additional_info TEXT,
+    old_cv_key TEXT,
+    amount_paid INTEGER NOT NULL,
+    payment_date TEXT NOT NULL,
+    transaction_ref TEXT NOT NULL,
+    receipt_key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'Payment Under Review' CHECK(status IN('Payment Pending','Payment Under Review','Payment Approved','Payment Rejected','In Progress','Completed','Delivered')),
+    admin_notes TEXT,
+    delivery_message TEXT,
+    delivered_at TEXT,
+    final_key TEXT,
+    final_name TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS cv_deliveries(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id INTEGER NOT NULL REFERENCES cv_service_requests(id) ON DELETE CASCADE,
+    file_key TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    message TEXT,
+    delivered_by INTEGER,
+    delivered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS users(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    google_sub TEXT NOT NULL UNIQUE,
+    email TEXT NOT NULL UNIQUE,
+    name TEXT,
+    picture TEXT,
+    role TEXT NOT NULL CHECK(role IN('job_seeker','employer')),
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN('active','suspended')),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_login_at TEXT
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS user_sessions(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    csrf TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS login_history(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_agent TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS job_seeker_profiles(
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    first_name TEXT, middle_name TEXT, last_name TEXT,
+    phone TEXT, alt_phone TEXT, dob TEXT, gender TEXT,
+    country TEXT, state TEXT, city TEXT, address TEXT,
+    title TEXT, objective TEXT, summary TEXT, skills TEXT,
+    experience_years INTEGER, pref_category TEXT, pref_employment_type TEXT,
+    expected_salary TEXT, pref_location TEXT, work_arrangement TEXT, availability TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS employer_profiles(
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    company_name TEXT, trading_name TEXT, description TEXT, industry TEXT, size TEXT,
+    year_established INTEGER, website TEXT, email TEXT, phone TEXT,
+    country TEXT, state TEXT, city TEXT, address TEXT, linkedin TEXT,
+    verification_status TEXT NOT NULL DEFAULT 'Not Submitted' CHECK(verification_status IN('Not Submitted','Pending Review','Verified','Rejected','More Information Required')),
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS education_records(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    institution TEXT NOT NULL, qualification TEXT NOT NULL, course TEXT, country TEXT,
+    start_date TEXT, end_date TEXT, description TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS work_experiences(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    company TEXT NOT NULL, title TEXT NOT NULL, employment_type TEXT, location TEXT,
+    start_date TEXT, end_date TEXT, is_current INTEGER NOT NULL DEFAULT 0,
+    responsibilities TEXT, description TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`
 ];
 
@@ -400,7 +559,14 @@ const AFTER=[
 
   `UPDATE services SET audience='Job seekers and graduates',full_description='One-to-one guidance to help you plan your career, make informed decisions and approach your job search with confidence.',benefits='["Clear direction for your career", "Guidance on job search strategy", "Support for graduates entering work", "Confidence in your next step"]',how_it_works='["Tell us about your background and goals", "We discuss your options and agree a plan", "We guide your job search and development", "We follow up as you progress"]' WHERE slug='career-guidance' AND audience IS NULL`,
 
-  `UPDATE services SET audience='Employers and candidates',full_description='We prepare candidates for interviews and help employers set up structured onboarding so new hires settle in and succeed.',benefits='["Stronger interview performance", "Structured onboarding for new hires", "Smoother transition from hire to success", "Better early retention"]',how_it_works='["Tell us whether you are a candidate or an employer", "We prepare the interview or onboarding plan", "We support you through the process", "We review progress together"]' WHERE slug='interview-onboarding' AND audience IS NULL`
+  `UPDATE services SET audience='Employers and candidates',full_description='We prepare candidates for interviews and help employers set up structured onboarding so new hires settle in and succeed.',benefits='["Stronger interview performance", "Structured onboarding for new hires", "Smoother transition from hire to success", "Better early retention"]',how_it_works='["Tell us whether you are a candidate or an employer", "We prepare the interview or onboarding plan", "We support you through the process", "We review progress together"]' WHERE slug='interview-onboarding' AND audience IS NULL`,
+
+  `CREATE INDEX IF NOT EXISTS idx_cvr_status ON cv_service_requests(status,created_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_cvr_email ON cv_service_requests(email)`,
+  `CREATE INDEX IF NOT EXISTS idx_us_user ON user_sessions(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_lh_user ON login_history(user_id,created_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_edu_user ON education_records(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_exp_user ON work_experiences(user_id)`
 ];
 
 let ready;
@@ -414,6 +580,76 @@ function ensureDb(env){return ready||(ready=(async()=>{
  await env.DB.batch(AFTER.map(x=>env.DB.prepare(x)));
  await env.DB.prepare('INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)').bind(SCHEMA_VERSION).run();
 })().catch(e=>{ready=null;throw e}))}
+
+// ---------------- ACCOUNTS (Google sign-in) ----------------
+const PF={job_seeker:['first_name','middle_name','last_name','phone','alt_phone','dob','gender','country','state','city','address','title','objective','summary','experience_years','pref_category','pref_employment_type','expected_salary','pref_location','work_arrangement','availability'],employer:['company_name','trading_name','description','industry','size','year_established','website','email','phone','country','state','city','address','linkedin']};
+const PT={job_seeker:'job_seeker_profiles',employer:'employer_profiles'};
+const LISTS={education:{t:'education_records',f:['institution','qualification','course','country','start_date','end_date','description'],req:['institution','qualification']},experience:{t:'work_experiences',f:['company','title','employment_type','location','start_date','end_date','responsibilities','description'],req:['company','title']}};
+async function googleVerify(env,cred){
+ if(!cred||cred.length>4000)return null;
+ const r=await fetch('https://oauth2.googleapis.com/tokeninfo?id_token='+encodeURIComponent(cred));if(!r.ok)return null;const t=await r.json();
+ if(t.aud!==env.GOOGLE_CLIENT_ID||!['accounts.google.com','https://accounts.google.com'].includes(t.iss)||+t.exp<Date.now()/1000||String(t.email_verified)!=='true'||!t.sub||!t.email)return null;
+ return{sub:t.sub,email:String(t.email).toLowerCase(),name:t.name||'',picture:t.picture||'',given:t.given_name||'',family:t.family_name||''}}
+async function userAuth(req,env){const m=(req.headers.get('cookie')||'').match(/mr_u=([a-f0-9]{64})/);if(!m)return null;
+ const r=await env.DB.prepare("SELECT s.csrf,s.expires_at exp,u.id uid,u.email,u.name,u.picture,u.role FROM user_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>? AND u.status='active'").bind(await sha(m[1]),Date.now()).first();
+ if(!r)return null;if(!['GET','HEAD'].includes(req.method)&&req.headers.get('x-csrf-token')!==r.csrf)return 'csrf';return r}
+const CK='; HttpOnly; Secure; SameSite=Lax; Path=/api';
+async function account(req,env,url,seg,M){
+ const a=seg[1],b=seg[2],id=parseInt(seg[3]);
+ if(a==='auth'){
+  if(b==='config'&&M==='GET')return json({google_client_id:env.GOOGLE_CLIENT_ID||null},200,{'cache-control':'no-store'});
+  if(b==='google'&&M==='POST'){
+   if(!(await limit(env,'gl:'+ip(req),20,600)))return fail('Too many attempts. Try again later.',429);
+   let bd;try{bd=await body(req)}catch{return fail('Invalid JSON')}
+   if(!env.GOOGLE_CLIENT_ID)return fail('Google sign-in is not configured yet.',503);
+   const g=await googleVerify(env,String(bd.credential||''));if(!g)return fail('Google sign-in could not be verified. Please try again.',401);
+   let u=await env.DB.prepare('SELECT * FROM users WHERE google_sub=? OR email=?').bind(g.sub,g.email).first();
+   if(!u){const role=bd.role;if(role!=='job_seeker'&&role!=='employer')return json({needs_role:true,preview:{name:g.name,email:g.email,picture:g.picture}});
+    const r=await env.DB.prepare('INSERT INTO users(google_sub,email,name,picture,role) VALUES(?,?,?,?,?)').bind(g.sub,g.email,g.name,g.picture,role).run(),uid=r.meta.last_row_id;
+    await (role==='employer'?env.DB.prepare('INSERT INTO employer_profiles(user_id,email) VALUES(?,?)').bind(uid,g.email):env.DB.prepare('INSERT INTO job_seeker_profiles(user_id,first_name,last_name) VALUES(?,?,?)').bind(uid,g.given,g.family)).run();
+    u={id:uid,role,status:'active'}}
+   else{if(u.status!=='active')return fail('This account is not active. Please contact support.',403);
+    await env.DB.prepare('UPDATE users SET google_sub=?,name=?,picture=?,last_login_at=CURRENT_TIMESTAMP WHERE id=?').bind(g.sub,g.name,g.picture,u.id).run()}
+   const tok=rnd(32),csrf=rnd(16);
+   await env.DB.batch([env.DB.prepare('INSERT INTO user_sessions(user_id,token_hash,csrf,expires_at) VALUES(?,?,?,?)').bind(u.id,await sha(tok),csrf,Date.now()+365*864e5),env.DB.prepare('INSERT INTO login_history(user_id,user_agent) VALUES(?,?)').bind(u.id,s(req.headers.get('user-agent'),200))]);
+   const prof=await env.DB.prepare(`SELECT * FROM ${PT[u.role]} WHERE user_id=?`).bind(u.id).first();
+   return json({user:{id:u.id,email:g.email,name:g.name,picture:g.picture,role:u.role},csrf,profile:prof},200,{'set-cookie':`mr_u=${tok}${CK}; Max-Age=31536000`,'cache-control':'no-store'})}
+  if((b==='logout'||b==='logout-all')&&M==='POST'){const u=await userAuth(req,env);if(u==='csrf')return fail('CSRF check failed',403);
+   if(u){if(b==='logout-all')await env.DB.prepare('DELETE FROM user_sessions WHERE user_id=?').bind(u.uid).run();else{const m=(req.headers.get('cookie')||'').match(/mr_u=([a-f0-9]{64})/);await env.DB.prepare('DELETE FROM user_sessions WHERE token_hash=?').bind(await sha(m[1])).run()}}
+   return json({ok:true},200,{'set-cookie':`mr_u=; Max-Age=0${CK}`})}
+  return fail('Not found',404)}
+ // /api/me...
+ const u=await userAuth(req,env);if(u==='csrf')return fail('CSRF check failed',403);if(!u)return fail('Unauthorized',401);
+ const NS={'cache-control':'no-store'};
+ if(!b&&M==='GET'){const prof=await env.DB.prepare(`SELECT * FROM ${PT[u.role]} WHERE user_id=?`).bind(u.uid).first();let hd=NS;if(u.exp<Date.now()+300*864e5){const m=(req.headers.get('cookie')||'').match(/mr_u=([a-f0-9]{64})/);if(m){await env.DB.prepare('UPDATE user_sessions SET expires_at=? WHERE token_hash=?').bind(Date.now()+365*864e5,await sha(m[1])).run();hd={...NS,'set-cookie':`mr_u=${m[1]}${CK}; Max-Age=31536000`}}}
+  return json({user:{id:u.uid,email:u.email,name:u.name,picture:u.picture,role:u.role},csrf:u.csrf,profile:prof},200,hd)}
+ if(b==='history'&&M==='GET')return json((await env.DB.prepare('SELECT user_agent,created_at FROM login_history WHERE user_id=? ORDER BY id DESC LIMIT 20').bind(u.uid).all()).results,200,NS);
+ if(b==='profile'&&M==='PATCH'){let bd;try{bd=await body(req)}catch{return fail('Invalid JSON')}
+  const sets=[],p=[],bad=m=>fail(m,422);
+  for(const k of PF[u.role]){if(!(k in bd))continue;let v=s(bd[k],['objective','summary','description','address'].includes(k)?4000:300);
+   if(['phone','alt_phone'].includes(k)&&v&&!/^\+?[0-9 ()-]{7,20}$/.test(v))return bad('Enter a valid phone number');
+   if(k==='email'&&v&&!emailOk(v))return bad('Enter a valid email address');
+   if(['website','linkedin'].includes(k)&&v&&!/^https?:\/\/[^\s]+$/.test(v))return bad('Links must start with http:// or https://');
+   if(k==='dob'&&v&&!/^\d{4}-\d{2}-\d{2}$/.test(v))return bad('Enter a valid date of birth');
+   if(['experience_years','year_established'].includes(k)){if(v===''){v=null}else{v=parseInt(v);if(!Number.isInteger(v)||v<0||v>2100)return bad('Enter a valid number for '+k.replace('_',' '))}}
+   sets.push(k+'=?');p.push(v===''?null:v)}
+  if(u.role==='job_seeker'&&Array.isArray(bd.skills)){sets.push('skills=?');p.push(JSON.stringify(bd.skills.map(x=>s(x,60)).filter(Boolean).slice(0,40)))}
+  if(!sets.length)return bad('Nothing to update');
+  await env.DB.prepare(`UPDATE ${PT[u.role]} SET ${sets.join(',')},updated_at=CURRENT_TIMESTAMP WHERE user_id=?`).bind(...p,u.uid).run();return json({ok:true})}
+ const L=LISTS[b];
+ if(L&&u.role==='job_seeker'){
+  if(M==='GET'&&!id)return json((await env.DB.prepare(`SELECT * FROM ${L.t} WHERE user_id=? ORDER BY COALESCE(end_date,'9999') DESC,id DESC`).bind(u.uid).all()).results,200,NS);
+  let bd={};if(M!=='DELETE'){try{bd=await body(req)}catch{return fail('Invalid JSON')}}
+  const cols=[...L.f],vals=cols.map(k=>s(bd[k],['description','responsibilities'].includes(k)?4000:300)||null);
+  if(b==='experience'){cols.push('is_current');vals.push(bd.is_current?1:0);if(bd.is_current){vals[cols.indexOf('end_date')]=null}}
+  for(const k of cols.filter(c=>/_date$/.test(c))){const v=vals[cols.indexOf(k)];if(v&&!/^\d{4}-\d{2}-\d{2}$/.test(v))return fail('Enter valid dates',422)}
+  if(M==='POST'){if(L.req.some(k=>!s(bd[k])))return fail('Please fill in the required fields',422);
+   const r=await env.DB.prepare(`INSERT INTO ${L.t}(user_id,${cols.join(',')}) VALUES(?,${cols.map(()=>'?').join(',')})`).bind(u.uid,...vals).run();return json({id:r.meta.last_row_id},201)}
+  if(!id)return fail('id required',422);
+  if(M==='PATCH'){if(L.req.some(k=>!s(bd[k])))return fail('Please fill in the required fields',422);
+   const r=await env.DB.prepare(`UPDATE ${L.t} SET ${cols.map(c=>c+'=?').join(',')} WHERE id=? AND user_id=?`).bind(...vals,id,u.uid).run();return r.meta.changes?json({ok:true}):fail('Not found',404)}
+  if(M==='DELETE'){const r=await env.DB.prepare(`DELETE FROM ${L.t} WHERE id=? AND user_id=?`).bind(id,u.uid).run();return r.meta.changes?json({ok:true}):fail('Not found',404)}}
+ return fail('Not found',404)}
 
 export default{async fetch(req,env){
  const url=new URL(req.url),path=url.pathname,cors=corsHeaders(req,env);
@@ -431,6 +667,7 @@ async function route(req,env,url,path){
  if(seg[0]==='media'){const key=seg.slice(1).join('/');if(!key.startsWith('public/'))return fail('Not found',404);
   const o=await env.MEDIA_BUCKET.get(key);if(!o)return fail('Not found',404);
   return new Response(o.body,{headers:{'content-type':o.httpMetadata?.contentType||'application/octet-stream','cache-control':'public, max-age=86400',...SEC}})}
+ if(seg[1]==='auth'||seg[1]==='me')return account(req,env,url,seg,M);
  if(seg[1]==='admin')return admin(req,env,url,seg,M);
  if(M==='GET'&&path==='/api/jobs')return json(await listJobs(url,env),200,cache);
  if(M==='GET'&&seg[1]==='jobs'&&seg[2]){const id=parseInt(seg[2]);
@@ -439,6 +676,15 @@ async function route(req,env,url,path){
   return json({job:j,related:rel.results},200,cache)}
  if(M==='GET'&&path==='/api/jobs-by-ids'){const ids=(url.searchParams.get('ids')||'').split(',').map(Number).filter(n=>Number.isInteger(n)&&n>0).slice(0,50);if(!ids.length)return json({jobs:[]});
   const r=await env.DB.prepare(`SELECT id,title,company,logo_key,location,employment_type,salary_type,salary_min,salary_max,currency,work_mode,deadline,created_at FROM jobs WHERE status='published' AND id IN (${ids.map(()=>'?').join(',')})`).bind(...ids).all();return json({jobs:r.results})}
+ if(M==='GET'&&path==='/api/cv/packages'){const[p,a]=await Promise.all([env.DB.prepare('SELECT id,name,kind,price,currency,description FROM cv_packages WHERE active=1 ORDER BY sort_order,id').all(),env.DB.prepare('SELECT bank_name,account_name,account_number,currency,instructions FROM payment_accounts WHERE active=1 ORDER BY id').all()]);return json({packages:p.results,accounts:a.results},200,{'cache-control':'public, max-age=30'})}
+ if(M==='POST'&&path==='/api/cv/requests')return cvSubmit(req,env);
+ if(M==='POST'&&path==='/api/cv/track'){if(!(await limit(env,'cvt:'+ip(req),30,600)))return fail('Too many attempts',429);let b;try{b=await body(req)}catch{return fail('Invalid JSON')}
+  const r=await env.DB.prepare('SELECT reference,package_name,package_kind,package_price,currency,amount_paid,status,created_at,updated_at,delivery_message,delivered_at,final_name,(final_key IS NOT NULL) has_file FROM cv_service_requests WHERE reference=? AND email=?').bind(s(b.reference,30).toUpperCase(),s(b.email,254).toLowerCase()).first();
+  return r?json(r,200,{'cache-control':'no-store'}):fail('No CV request matches that reference and email',404)}
+ if(M==='POST'&&path==='/api/cv/file'){if(!(await limit(env,'cvf:'+ip(req),20,600)))return fail('Too many attempts',429);let b;try{b=await body(req)}catch{return fail('Invalid JSON')}
+  const r=await env.DB.prepare("SELECT final_key FROM cv_service_requests WHERE reference=? AND email=? AND status='Delivered' AND final_key IS NOT NULL").bind(s(b.reference,30).toUpperCase(),s(b.email,254).toLowerCase()).first();
+  if(!r)return fail('Not available',404);const o=await env.MEDIA_BUCKET.get(r.final_key);if(!o)return fail('Not found',404);
+  return new Response(o.body,{headers:{'content-type':'application/pdf','content-disposition':'inline','cache-control':'private, no-store',...SEC}})}
  if(M==='GET'&&path==='/api/job-filters'){const g=async c=>(await env.DB.prepare(`SELECT DISTINCT ${c} v FROM jobs WHERE status='published' AND ${c} IS NOT NULL AND ${c}!='' ORDER BY v LIMIT 100`).all()).results.map(r=>r.v);return json({countries:await g('country'),states:await g('state'),cities:await g('city')},200,cache)}
  if(M==='GET'&&path==='/api/categories')return json((await env.DB.prepare('SELECT c.id,c.name,c.slug,c.icon,(SELECT COUNT(*) FROM jobs j WHERE j.category_id=c.id AND j.status=\'published\') open_jobs FROM job_categories c ORDER BY sort_order,name').all()).results,200,cache);
  if(M==='GET'&&path==='/api/services')return json((await env.DB.prepare('SELECT id,slug,name,description,full_description,audience,benefits,how_it_works,image_key,icon FROM services WHERE active=1 ORDER BY sort_order').all()).results,200,cache);
@@ -528,9 +774,9 @@ async function admin(req,env,url,seg,M){
    await env.DB.prepare('UPDATE applications SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').bind(b.status,id).run();await audit(env,req,au,'application.status','applications',id);return json({ok:true})}
   if(M==='POST'&&seg[4]==='notes'){if(!s(b.note,2000))return fail('Note required',422);await env.DB.prepare('INSERT INTO application_notes(application_id,admin_id,note) VALUES(?,?,?)').bind(id,au.uid,s(b.note,2000)).run();return json({ok:true},201)}}
  if(a==='cvfile'&&M==='GET'){const k=url.searchParams.get('k')||'',e=+url.searchParams.get('e'),sg=url.searchParams.get('sig')||'';
-  if(!k.startsWith('private/cv/')||e<Date.now()||sg!==await hmac(env,k+e))return fail('Link invalid or expired',403);
+  if(!/^private\/cv(-pay|-old|-done)?\//.test(k)||e<Date.now()||sg!==await hmac(env,k+e))return fail('Link invalid or expired',403);
   const o=await env.MEDIA_BUCKET.get(k);if(!o)return fail('Not found',404);
-  return new Response(o.body,{headers:{'content-type':o.httpMetadata?.contentType||'application/octet-stream','content-disposition':'attachment','cache-control':'private, no-store',...SEC}})}
+  return new Response(o.body,{headers:{'content-type':o.httpMetadata?.contentType||'application/octet-stream','content-disposition':/^(image\/|application\/pdf)/.test(o.httpMetadata?.contentType||'')?'inline':'attachment','cache-control':'private, no-store',...SEC}})}
  if(a==='inquiries'&&M==='GET')return json((await env.DB.prepare('SELECT * FROM employer_inquiries ORDER BY created_at DESC LIMIT 100').all()).results);
  if(a==='inquiries'&&M==='PATCH'&&id){let b;try{b=await body(req)}catch{return fail('Invalid JSON')}
   if(!['New','Contacted','In Progress','Closed','Archived'].includes(b.status))return fail('Invalid status',422);
@@ -590,5 +836,45 @@ async function admin(req,env,url,seg,M){
    if('sort_order' in b){sets.push('sort_order=?');p.push(parseInt(b.sort_order)||0)}if('active' in b){sets.push('active=?');p.push(b.active?1:0)}
    if(!sets.length)return fail('Nothing to update',422);await env.DB.prepare(`UPDATE homepage_banners SET ${sets.join(',')} WHERE id=?`).bind(...p,id).run();await audit(env,req,au,'banner.update','homepage_banners',id);return json({ok:true})}
   if(M==='DELETE'){await env.DB.prepare('DELETE FROM homepage_banners WHERE id=?').bind(id).run();await audit(env,req,au,'banner.delete','homepage_banners',id);return json({ok:true})}}
+
+ if(a==='cv-packages'||a==='payment-accounts'){
+  const T=a==='cv-packages'?'cv_packages':'payment_accounts',F=a==='cv-packages'?['name','kind','price','currency','description','sort_order']:['bank_name','account_name','account_number','currency','instructions'];
+  if(M==='GET')return json((await env.DB.prepare(`SELECT * FROM ${T} ORDER BY id`).all()).results);
+  let b={};if(M!=='DELETE'){try{b=await body(req)}catch{return fail('Invalid JSON')}}
+  const val=k=>k==='price'||k==='sort_order'?(Number.isFinite(+b[k])?Math.round(+b[k]):0):s(b[k],1000);
+  try{
+   if(M==='POST'){
+    if(T==='cv_packages'&&(!s(b.name)||!['new','revamp'].includes(b.kind)||!(+b.price>=0)))return fail('Name, type and price are required',422);
+    if(T==='payment_accounts'&&(!s(b.bank_name)||!s(b.account_name)||!s(b.account_number)))return fail('Bank, account name and number are required',422);
+    const cols=[...F,'active'],r=await env.DB.prepare(`INSERT INTO ${T}(${cols.join(',')}) VALUES(${cols.map(()=>'?').join(',')})`).bind(...F.map(val),b.active===0?0:1).run();
+    await audit(env,req,au,a+'.create',T,r.meta.last_row_id);return json({id:r.meta.last_row_id},201)}
+   if(!id)return fail('id required',422);
+   if(M==='PATCH'){const sets=[],p=[];for(const k of F)if(k in b){sets.push(k+'=?');p.push(val(k))}if('active' in b){sets.push('active=?');p.push(b.active?1:0)}
+    if(!sets.length)return fail('Nothing to update',422);await env.DB.prepare(`UPDATE ${T} SET ${sets.join(',')} WHERE id=?`).bind(...p,id).run();await audit(env,req,au,a+'.update',T,id);return json({ok:true})}
+   if(M==='DELETE'){await env.DB.prepare(`DELETE FROM ${T} WHERE id=?`).bind(id).run();await audit(env,req,au,a+'.delete',T,id);return json({ok:true})}
+  }catch(e){return fail('Could not save. It may be in use by existing orders; deactivate it instead.',409)}}
+ if(a==='cv-requests'){
+  if(M==='GET'&&!id){const q=url.searchParams,w=['1=1'],p=[],st=s(q.get('status'),30),kw=s(q.get('q'),80);if(st){w.push('status=?');p.push(st)}
+   if(kw){w.push('(full_name LIKE ? OR email LIKE ? OR reference LIKE ?)');const l=`%${kw.replace(/[%_]/g,'')}%`;p.push(l,l,l)}const page=Math.max(1,parseInt(q.get('page'))||1);
+   return json({requests:(await env.DB.prepare(`SELECT id,reference,full_name,email,package_name,package_price,currency,status,created_at FROM cv_service_requests WHERE ${w.join(' AND ')} ORDER BY created_at DESC LIMIT 25 OFFSET ?`).bind(...p,(page-1)*25).all()).results,page})}
+  if(!id)return fail('id required',422);
+  if(M==='GET'&&!seg[4]){const x=await env.DB.prepare('SELECT * FROM cv_service_requests WHERE id=?').bind(id).first();if(!x)return fail('Not found',404);
+   const{receipt_key,old_cv_key,final_key,...pub}=x,dv=await env.DB.prepare('SELECT file_name,message,delivered_at FROM cv_deliveries WHERE request_id=? ORDER BY id DESC').bind(id).all();
+   return json({...pub,has_receipt:!!receipt_key,has_old:!!old_cv_key,has_final:!!final_key,deliveries:dv.results})}
+  if(M==='GET'&&seg[4]==='file'){const x=await env.DB.prepare('SELECT receipt_key,old_cv_key,final_key FROM cv_service_requests WHERE id=?').bind(id).first(),k=x&&{receipt:x.receipt_key,old:x.old_cv_key,final:x.final_key}[url.searchParams.get('which')];
+   if(!k)return fail('No such file',404);const exp=Date.now()+300000,sig=await hmac(env,k+exp);await audit(env,req,au,'cvfile.access','cv_service_requests',id);
+   return json({url:`/api/admin/cvfile?k=${encodeURIComponent(k)}&e=${exp}&sig=${sig}`})}
+  if(M==='PATCH'){let b;try{b=await body(req)}catch{return fail('Invalid JSON')}const okS=['Payment Pending','Payment Under Review','Payment Approved','Payment Rejected','In Progress','Completed'],sets=[],p=[];
+   if('status' in b){if(!okS.includes(b.status))return fail('Invalid status',422);sets.push('status=?');p.push(b.status)}if('admin_notes' in b){sets.push('admin_notes=?');p.push(s(b.admin_notes,2000))}
+   if(!sets.length)return fail('Nothing to update',422);await env.DB.prepare(`UPDATE cv_service_requests SET ${sets.join(',')},updated_at=CURRENT_TIMESTAMP WHERE id=?`).bind(...p,id).run();await audit(env,req,au,'cv.update','cv_service_requests',id);return json({ok:true})}
+  if(M==='POST'&&seg[4]==='deliver'){
+   if(+req.headers.get('content-length')>7*1024*1024)return fail('File too large',413);
+   const x=await env.DB.prepare('SELECT reference,status FROM cv_service_requests WHERE id=?').bind(id).first();if(!x)return fail('Not found',404);
+   if(!['Payment Approved','In Progress','Completed','Delivered'].includes(x.status))return fail('Approve the payment before delivering the CV',409);
+   const f=await req.formData(),file=f.get('file');if(await sniff(file,['pdf'])!=='pdf')return fail('Upload the completed CV as a PDF (max 5 MB)',422);
+   const key=`private/cv-done/${x.reference}-${rnd(6)}.pdf`,name=(file.name||'CV.pdf').slice(0,120),msg=s(f.get('message'),1000);
+   await env.MEDIA_BUCKET.put(key,file.stream(),{httpMetadata:{contentType:'application/pdf'}});
+   await env.DB.batch([env.DB.prepare('INSERT INTO cv_deliveries(request_id,file_key,file_name,message,delivered_by) VALUES(?,?,?,?,?)').bind(id,key,name,msg,au.uid),env.DB.prepare("UPDATE cv_service_requests SET final_key=?,final_name=?,delivery_message=?,delivered_at=CURRENT_TIMESTAMP,status='Delivered',updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(key,name,msg,id)]);
+   await audit(env,req,au,'cv.deliver','cv_service_requests',id);return json({ok:true})}}
 
  return fail('Not found',404)}
