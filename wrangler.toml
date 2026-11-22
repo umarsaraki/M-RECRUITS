@@ -1,0 +1,25 @@
+name = "m-recruits"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+# Keep variables you add in the Cloudflare dashboard (for example GOOGLE_CLIENT_ID) when deploying from GitHub.
+keep_vars = true
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = ["/api/*", "/media/*"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "m-recruits-db"
+database_id = "b105e245-2104-4c26-a43e-1e9df5689f0f"
+
+[[r2_buckets]]
+binding = "MEDIA_BUCKET"
+bucket_name = "m-recruits-media"
+
+[vars]
+ALLOWED_ORIGIN = "https://your-domain.com"
+
+[observability]
+enabled = true
