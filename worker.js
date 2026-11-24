@@ -5,6 +5,15 @@ const sha=async s=>hex(await crypto.subtle.digest('SHA-256',enc.encode(s)));
 const SEC={'x-content-type-options':'nosniff','referrer-policy':'strict-origin-when-cross-origin','x-frame-options':'DENY','content-security-policy':"frame-ancestors 'none'"};
 const json=(d,s=200,h={})=>new Response(JSON.stringify(d),{status:s,headers:{'content-type':'application/json',...SEC,...h}});
 const fail=(m,s=400)=>json({error:m},s);
+// ---- central error handling: users only ever see a safe message and a reference code ----
+const SAFE='We could not complete your request. Please try again later.';
+const clean=m=>String(m??'').replace(/Bearer\s+\S+/gi,'Bearer [hidden]').replace(/(key|token|secret|password|pass|authorization)\s*[=:]\s*\S+/gi,'$1=[hidden]').replace(/[A-Za-z0-9_\-+\/=]{32,}/g,'[hidden]').replace(/[\w.+-]+@[\w-]+\.[\w.]+/g,'[email]').replace(/\/[\w.\/-]+\.(js|mjs|ts)(:\d+)*/g,'[path]').slice(0,300);
+const catOf=m=>/D1_|SQLITE|no such (table|column)|constraint|migration|database/i.test(m)?'database':/R2|bucket|MEDIA/i.test(m)?'storage':/fetch|network|google|timeout/i.test(m)?'external service':'application';
+async function logError(env,req,path,e,status=500){
+ const ref=`MR-${new Date().getUTCFullYear()}-${rnd(3).toUpperCase()}`,msg=clean(e&&e.message),cat=catOf(msg),mod=String(path||'').split('/')[2]||'site';
+ console.error(`[${ref}] ${cat} ${mod}: ${msg}`);
+ try{await env.DB.prepare('INSERT INTO error_logs(ref,category,module,method,status,summary) VALUES(?,?,?,?,?,?)').bind(ref,cat,mod,req.method,status,msg).run()}catch{}
+ return ref}
 const MAXB=6*1024*1024,CV_MAX=5*1024*1024;
 const s=(v,max=500)=>String(v??'').trim().slice(0,max);
 const emailOk=e=>/^[^\s@]{1,64}@[^\s@]+\.[^\s@]{2,}$/.test(e)&&e.length<=254;
@@ -114,7 +123,7 @@ async function simpleInsert(req,env,table,fields,prefix,extra){
  if(!(await limit(env,table+':'+ip(req),8,3600)))return fail('Too many requests',429);
  let b;try{b=await body(req)}catch{return fail('Invalid JSON')}
  const v={};for(const[k,t,max]of fields){v[k]=t==='int'?parseInt(b[k]):s(b[k],max||300);
-  if(t==='req'&&!v[k]||t==='int'&&!(v[k]>0)||t==='email'&&!emailOk(v[k]))return fail('Invalid or missing: '+k,422)}
+  if(t==='req'&&!v[k]||t==='int'&&!(v[k]>0)||t==='email'&&!emailOk(v[k]))return json({error:'Validation failed',fields:{[k]:t==='email'?'Invalid email':'Required'}},422)}
  if(b.consent!==true&&table==='employer_inquiries'&&false)return fail('Consent required',422);
  const reference=ref(prefix),cols=Object.keys(v),extraV=extra?await extra(v,env):{};
  if(extraV===null)return fail('Unknown service',404);
@@ -135,7 +144,7 @@ async function simpleInsert(req,env,table,fields,prefix,extra){
 //   - new index / starter rows -> add to AFTER
 //   then increase SCHEMA_VERSION by 1 and deploy. It applies by itself.
 // ======================================================================
-const SCHEMA_VERSION=6;
+const SCHEMA_VERSION=8;
 
 // ---------------------------- TABLES ----------------------------------
 const TABLES=[
@@ -307,7 +316,10 @@ const TABLES=[
     sort_order INTEGER NOT NULL DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
     starts_at TEXT,
-    ends_at TEXT
+    ends_at TEXT,
+    button_text TEXT,
+    seconds INTEGER NOT NULL DEFAULT 5,
+    mobile_image_key TEXT
   )`,
 
   `CREATE TABLE IF NOT EXISTS website_settings(
@@ -489,6 +501,17 @@ const TABLES=[
     responsibilities TEXT, description TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`
+,
+  `CREATE TABLE IF NOT EXISTS error_logs(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref TEXT NOT NULL,
+    category TEXT NOT NULL,
+    module TEXT,
+    method TEXT,
+    status INTEGER,
+    summary TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`
 ];
 
 // ------------- COLUMNS added after first release (safe to re-run) -----
@@ -511,7 +534,10 @@ const COLS=[
   ["applications", "cv_name", "TEXT"],
   ["applications", "cv_size", "INTEGER"],
   ["homepage_banners", "starts_at", "TEXT"],
-  ["homepage_banners", "ends_at", "TEXT"]
+  ["homepage_banners", "ends_at", "TEXT"],
+  ["homepage_banners", "button_text", "TEXT"],
+  ["homepage_banners", "seconds", "INTEGER NOT NULL DEFAULT 5"],
+  ["homepage_banners", "mobile_image_key", "TEXT"]
 ];
 
 // ------------- INDEXES + STARTER CONTENT (safe to re-run) -------------
@@ -573,6 +599,9 @@ const AFTER=[
   `CREATE INDEX IF NOT EXISTS idx_lh_user ON login_history(user_id,created_at DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_edu_user ON education_records(user_id)`,
   `CREATE INDEX IF NOT EXISTS idx_exp_user ON work_experiences(user_id)`
+,
+  `CREATE INDEX IF NOT EXISTS idx_el_time ON error_logs(id DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_el_ref ON error_logs(ref)`
 ];
 
 let ready;
@@ -585,7 +614,7 @@ function ensureDb(env){return ready||(ready=(async()=>{
   if(!have.some(x=>x.name===c)){try{await env.DB.prepare(`ALTER TABLE ${t} ADD COLUMN ${c} ${d}`).run()}catch(e){if(!/duplicate column/i.test(e.message))throw e}}}
  await env.DB.batch(AFTER.map(x=>env.DB.prepare(x)));
  await env.DB.prepare('INSERT OR IGNORE INTO schema_migrations(version) VALUES(?)').bind(SCHEMA_VERSION).run();
-})().catch(e=>{ready=null;console.error('migration failed',e.message);throw e}))}
+})().catch(e=>{ready=null;console.error('migration failed',clean(e.message));throw e}))}
 
 // ---------------- ACCOUNTS (Google sign-in) ----------------
 const PF={job_seeker:['first_name','middle_name','last_name','phone','alt_phone','dob','gender','country','state','city','address','title','objective','summary','experience_years','pref_category','pref_employment_type','expected_salary','pref_location','work_arrangement','availability'],employer:['company_name','trading_name','description','industry','size','year_established','website','email','phone','country','state','city','address','linkedin']};
@@ -665,13 +694,13 @@ export default{async fetch(req,env){
   let err=null;try{await ensureDb(env)}catch(e){err=e}
   const out={worker_schema_version:SCHEMA_VERSION,database:err?'error':'ok'};
   if(env.ADMIN_BOOTSTRAP_SECRET&&url.searchParams.get('key')===env.ADMIN_BOOTSTRAP_SECRET){ // details only with your ADMIN_BOOTSTRAP_SECRET
-   out.error=err?String(err.message).slice(0,500):null;
+   out.error=err?clean(err.message):null;
    try{out.recorded_version=(await env.DB.prepare('SELECT MAX(version) v FROM schema_migrations').first())?.v??null}catch{out.recorded_version='none'}
    try{out.tables=(await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all()).results.map(r=>r.name)}catch{}
    try{out.banner_columns=(await env.DB.prepare('PRAGMA table_info(homepage_banners)').all()).results.map(r=>r.name)}catch{}}
   return json(out,err?500:200,{'cache-control':'no-store'})}
  try{await ensureDb(env);const r=await route(req,env,url,path);const h=new Headers(r.headers);for(const[k,v]of Object.entries(cors))h.set(k,v);return new Response(r.body,{status:r.status,headers:h})}
- catch(e){console.error('err',path,e.message);return fail('Internal error',500)}},
+ catch(e){const ref=await logError(env,req,path,e);return json({error:SAFE,ref},500)}},
 
  async scheduled(){}};
 
@@ -703,7 +732,7 @@ async function route(req,env,url,path){
  if(M==='GET'&&path==='/api/job-filters'){const g=async c=>(await env.DB.prepare(`SELECT DISTINCT ${c} v FROM jobs WHERE status='published' AND ${c} IS NOT NULL AND ${c}!='' ORDER BY v LIMIT 100`).all()).results.map(r=>r.v);return json({countries:await g('country'),states:await g('state'),cities:await g('city')},200,cache)}
  if(M==='GET'&&path==='/api/categories')return json((await env.DB.prepare('SELECT c.id,c.name,c.slug,c.icon,(SELECT COUNT(*) FROM jobs j WHERE j.category_id=c.id AND j.status=\'published\') open_jobs FROM job_categories c ORDER BY sort_order,name').all()).results,200,cache);
  if(M==='GET'&&path==='/api/services')return json((await env.DB.prepare('SELECT id,slug,name,description,full_description,audience,benefits,how_it_works,image_key,icon FROM services WHERE active=1 ORDER BY sort_order').all()).results,200,cache);
- if(M==='GET'&&path==='/api/banners')return json((await env.DB.prepare("SELECT id,image_key,headline,subtitle,link FROM homepage_banners WHERE active=1 AND (starts_at IS NULL OR starts_at<=CURRENT_TIMESTAMP) AND (ends_at IS NULL OR ends_at>=CURRENT_TIMESTAMP) ORDER BY sort_order,id").all()).results,200,cache);
+ if(M==='GET'&&path==='/api/banners')return json((await env.DB.prepare("SELECT id,image_key,mobile_image_key,headline,subtitle,link,button_text,seconds FROM homepage_banners WHERE active=1 AND (starts_at IS NULL OR starts_at<=CURRENT_TIMESTAMP) AND (ends_at IS NULL OR ends_at>=CURRENT_TIMESTAMP) ORDER BY sort_order,id").all()).results,200,cache);
  if(M==='GET'&&path==='/api/stats'){const r=await env.DB.prepare("SELECT (SELECT COUNT(*) FROM jobs WHERE status='published') jobs,(SELECT COUNT(*) FROM applications) applications,(SELECT COUNT(*) FROM employer_inquiries) employers").first();return json(r,200,cache)}
  if(M==='GET'&&path==='/api/settings'){const r=await env.DB.prepare("SELECT key,value FROM website_settings WHERE key NOT LIKE 'private_%'").all();return json(Object.fromEntries(r.results.map(x=>[x.key,x.value])),200,cache)}
  if(M==='POST'&&path==='/api/applications')return submitApplication(req,env);
@@ -839,16 +868,17 @@ async function admin(req,env,url,seg,M){
    if(M==='DELETE'){await env.DB.prepare('DELETE FROM job_categories WHERE id=?').bind(id).run();await audit(env,req,au,'category.delete','job_categories',id);return json({ok:true})}
   }catch(e){return fail('That category name already exists',409)}}
  if(a==='banners'){
-  const BF=['image_key','headline','subtitle','link','starts_at','ends_at'];
+  const BF=['image_key','mobile_image_key','headline','subtitle','link','button_text','starts_at','ends_at'];
   if(M==='GET')return json((await env.DB.prepare('SELECT * FROM homepage_banners ORDER BY sort_order,id').all()).results);
   let b={};if(M!=='DELETE'){try{b=await body(req)}catch{return fail('Invalid JSON')}}
-  const v=k=>{const x=s(b[k],500)||null;if(!x)return null;if(k==='link'&&!/^(#|\/|https:\/\/)/.test(x))return null;if(k==='image_key'&&!/^public\/banner\/[a-f0-9]+\.(png|jpg|webp)$/.test(x))return null;return x};
+  const v=k=>{const x=s(b[k],500)||null;if(!x)return null;if(k==='link'&&!/^(#|\/|https:\/\/)/.test(x))return null;if((k==='image_key'||k==='mobile_image_key')&&!/^public\/banner\/[a-f0-9]+\.(png|jpg|webp)$/.test(x))return null;return x};
   if(M==='POST'){if(!v('image_key'))return fail('Upload a banner image first',422);
-   const r=await env.DB.prepare(`INSERT INTO homepage_banners(${BF.join(',')},sort_order,active) VALUES(${BF.map(()=>'?').join(',')},?,?)`).bind(...BF.map(v),parseInt(b.sort_order)||0,b.active===0||b.active===false?0:1).run();
+   const r=await env.DB.prepare(`INSERT INTO homepage_banners(${BF.join(',')},sort_order,active,seconds) VALUES(${BF.map(()=>'?').join(',')},?,?,?)`).bind(...BF.map(v),parseInt(b.sort_order)||0,b.active===0||b.active===false?0:1,Math.min(20,Math.max(2,parseInt(b.seconds)||5))).run();
    await audit(env,req,au,'banner.create','homepage_banners',r.meta.last_row_id);return json({id:r.meta.last_row_id},201)}
   if(!id)return fail('id required',422);
   if(M==='PATCH'){const sets=[],p=[];for(const k of BF)if(k in b){if(k==='image_key'&&!v(k))continue;sets.push(k+'=?');p.push(v(k))}
    if('sort_order' in b){sets.push('sort_order=?');p.push(parseInt(b.sort_order)||0)}if('active' in b){sets.push('active=?');p.push(b.active?1:0)}
+   if('seconds' in b){sets.push('seconds=?');p.push(Math.min(20,Math.max(2,parseInt(b.seconds)||5)))}
    if(!sets.length)return fail('Nothing to update',422);await env.DB.prepare(`UPDATE homepage_banners SET ${sets.join(',')} WHERE id=?`).bind(...p,id).run();await audit(env,req,au,'banner.update','homepage_banners',id);return json({ok:true})}
   if(M==='DELETE'){await env.DB.prepare('DELETE FROM homepage_banners WHERE id=?').bind(id).run();await audit(env,req,au,'banner.delete','homepage_banners',id);return json({ok:true})}}
 
@@ -891,5 +921,10 @@ async function admin(req,env,url,seg,M){
    await env.MEDIA_BUCKET.put(key,file.stream(),{httpMetadata:{contentType:'application/pdf'}});
    await env.DB.batch([env.DB.prepare('INSERT INTO cv_deliveries(request_id,file_key,file_name,message,delivered_by) VALUES(?,?,?,?,?)').bind(id,key,name,msg,au.uid),env.DB.prepare("UPDATE cv_service_requests SET final_key=?,final_name=?,delivery_message=?,delivered_at=CURRENT_TIMESTAMP,status='Delivered',updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(key,name,msg,id)]);
    await audit(env,req,au,'cv.deliver','cv_service_requests',id);return json({ok:true})}}
+
+ if(a==='error-logs'&&M==='GET'){const q=url.searchParams,w=['1=1'],p=[],c=s(q.get('category'),30),kw=s(q.get('q'),40);
+  if(c){w.push('category=?');p.push(c)}if(kw){w.push('(ref LIKE ? OR module LIKE ?)');const l=`%${kw.replace(/[%_]/g,'')}%`;p.push(l,l)}
+  const page=Math.max(1,parseInt(q.get('page'))||1);
+  return json({logs:(await env.DB.prepare(`SELECT ref,category,module,method,status,summary,created_at FROM error_logs WHERE ${w.join(' AND ')} ORDER BY id DESC LIMIT 50 OFFSET ?`).bind(...p,(page-1)*50).all()).results,page})}
 
  return fail('Not found',404)}
