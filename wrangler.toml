@@ -20,6 +20,8 @@ bucket_name = "m-recruits-media"
 
 [vars]
 ALLOWED_ORIGIN = "https://your-domain.com"
+# A Google client ID is public, so it is safe to keep it here. Uncomment and paste yours so a deploy can never remove it:
+# GOOGLE_CLIENT_ID = "123456789-abc.apps.googleusercontent.com"
 
 [observability]
 enabled = true
