@@ -90,6 +90,7 @@ async function cvSubmit(req,env){
  if(ok)await env.MEDIA_BUCKET.put(ok,f.get('old_cv').stream(),{httpMetadata:{contentType:MT[oe]}});
  try{await env.DB.prepare('INSERT INTO cv_service_requests(reference,package_id,package_name,package_kind,package_price,currency,full_name,email,phone,location,country,objective,summary,education,experience,skills,certifications,languages,achievements,referees,additional_info,old_cv_key,amount_paid,payment_date,transaction_ref,receipt_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)').bind(reference,pk.id,pk.name,pk.kind,pk.price,pk.currency,d.full_name,d.email,d.phone,d.location,d.country,d.objective,d.summary,d.education,d.experience,d.skills,d.certifications,d.languages,d.achievements,d.referees,d.additional_info,ok,amt,d.payment_date,d.transaction_ref,rk).run()}
  catch(e){await env.MEDIA_BUCKET.delete(rk);if(ok)await env.MEDIA_BUCKET.delete(ok);return fail('Could not save your request. Please try again.',500)}
+ await notifyAdmin(env,'cv_order','New CV order',pk.name+' - '+reference,'#/admin/cv');
  return json({reference},201)}
 
 async function submitApplication(req,env){
@@ -129,6 +130,7 @@ async function simpleInsert(req,env,table,fields,prefix,extra){
  if(extraV===null)return fail('Unknown service',404);
  const all={...v,...extraV};
  await env.DB.prepare(`INSERT INTO ${table}(reference,${Object.keys(all).join(',')}) VALUES(?,${Object.keys(all).map(()=>'?').join(',')})`).bind(reference,...Object.values(all)).run();
+ await notifyAdmin(env,'support','New '+(table==='service_requests'?'service request':'employer inquiry'),reference,'#/admin/dash');
  return json({reference},201)}
 
 // ---------- router ----------
@@ -144,7 +146,7 @@ async function simpleInsert(req,env,table,fields,prefix,extra){
 //   - new index / starter rows -> add to AFTER
 //   then increase SCHEMA_VERSION by 1 and deploy. It applies by itself.
 // ======================================================================
-const SCHEMA_VERSION=8;
+const SCHEMA_VERSION=9;
 
 // ---------------------------- TABLES ----------------------------------
 const TABLES=[
@@ -512,6 +514,58 @@ const TABLES=[
     summary TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`
+,
+  `CREATE TABLE IF NOT EXISTS user_personal(
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    username TEXT UNIQUE,
+    first_name TEXT, middle_name TEXT, last_name TEXT, full_name TEXT,
+    phone TEXT, phone_verified INTEGER NOT NULL DEFAULT 0,
+    gender TEXT, dob TEXT, country TEXT, state TEXT, city TEXT, address TEXT,
+    bio TEXT, language TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS user_settings(
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    data TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS notifications(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    for_admin INTEGER NOT NULL DEFAULT 0,
+    type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT,
+    link TEXT,
+    read_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS announcements(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    audience TEXT NOT NULL CHECK(audience IN('all','job_seeker','employer')),
+    link TEXT,
+    recipients INTEGER NOT NULL DEFAULT 0,
+    created_by INTEGER REFERENCES admin_users(id),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS email_change_requests(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    new_email TEXT NOT NULL,
+    reason TEXT,
+    status TEXT NOT NULL DEFAULT 'Pending' CHECK(status IN('Pending','Approved','Rejected')),
+    admin_note TEXT,
+    applied_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    decided_at TEXT,
+    decided_by INTEGER REFERENCES admin_users(id)
+  )`
 ];
 
 // ------------- COLUMNS added after first release (safe to re-run) -----
@@ -537,7 +591,8 @@ const COLS=[
   ["homepage_banners", "ends_at", "TEXT"],
   ["homepage_banners", "button_text", "TEXT"],
   ["homepage_banners", "seconds", "INTEGER NOT NULL DEFAULT 5"],
-  ["homepage_banners", "mobile_image_key", "TEXT"]
+  ["homepage_banners", "mobile_image_key", "TEXT"],
+  ["users", "photo_key", "TEXT"]
 ];
 
 // ------------- INDEXES + STARTER CONTENT (safe to re-run) -------------
@@ -602,6 +657,11 @@ const AFTER=[
 ,
   `CREATE INDEX IF NOT EXISTS idx_el_time ON error_logs(id DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_el_ref ON error_logs(ref)`
+,
+  `CREATE INDEX IF NOT EXISTS idx_notif_user ON notifications(user_id,read_at,id DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_notif_admin ON notifications(for_admin,read_at,id DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_ecr_status ON email_change_requests(status,id DESC)`,
+  `INSERT OR IGNORE INTO user_personal(user_id,first_name,middle_name,last_name,phone,gender,dob,country,state,city,address) SELECT user_id,first_name,middle_name,last_name,phone,gender,dob,country,state,city,address FROM job_seeker_profiles`
 ];
 
 let ready;
@@ -625,10 +685,27 @@ async function googleVerify(env,cred){
  const r=await fetch('https://oauth2.googleapis.com/tokeninfo?id_token='+encodeURIComponent(cred));if(!r.ok)return null;const t=await r.json();
  if(t.aud!==env.GOOGLE_CLIENT_ID||!['accounts.google.com','https://accounts.google.com'].includes(t.iss)||+t.exp<Date.now()/1000||String(t.email_verified)!=='true'||!t.sub||!t.email)return null;
  return{sub:t.sub,email:String(t.email).toLowerCase(),name:t.name||'',picture:t.picture||'',given:t.given_name||'',family:t.family_name||''}}
-async function userAuth(req,env){const m=(req.headers.get('cookie')||'').match(/mr_u=([a-f0-9]{64})/);if(!m)return null;
- const r=await env.DB.prepare("SELECT s.csrf,s.expires_at exp,u.id uid,u.email,u.name,u.picture,u.role FROM user_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>? AND u.status='active'").bind(await sha(m[1]),Date.now()).first();
- if(!r)return null;if(!['GET','HEAD'].includes(req.method)&&req.headers.get('x-csrf-token')!==r.csrf)return 'csrf';return r}
+async function userAuth(req,env,noCsrf=false){const m=(req.headers.get('cookie')||'').match(/mr_u=([a-f0-9]{64})/);if(!m)return null;
+ const r=await env.DB.prepare("SELECT s.csrf,s.expires_at exp,u.id uid,u.email,u.name,u.picture,u.photo_key,u.role FROM user_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>? AND u.status='active'").bind(await sha(m[1]),Date.now()).first();
+ if(!r)return null;if(!noCsrf&&!['GET','HEAD'].includes(req.method)&&req.headers.get('x-csrf-token')!==r.csrf)return 'csrf';return r}
 const CK='; HttpOnly; Secure; SameSite=Lax; Path=/api';
+// ---------------- notifications, settings, personal info (phase 1) ----------------
+const THEMES=['light','dark','system'],FSIZES=['small','medium','large'],FFAM=['default','verdana','georgia','trebuchet','system'],NTYPES=['job_alerts','application_updates','profile_views','messages','service_updates','announcements'],LANGS=['English','Hausa','Yoruba','Igbo','French','Arabic'];
+const safeLink=l=>(l&&/^#\/[\w\-\/?=&%.]*$/.test(l))?l:null;
+// notifications never break the action that caused them
+async function notify(env,uid,type,title,body,link){try{
+ if(type!=='account_security'){const row=await env.DB.prepare('SELECT data FROM user_settings WHERE user_id=?').bind(uid).first();let st={};try{st=JSON.parse(row?.data||'{}')}catch{}if(st.notify&&st.notify[type]===false)return false}
+ await env.DB.prepare('INSERT INTO notifications(user_id,type,title,body,link) VALUES(?,?,?,?,?)').bind(uid,type,s(title,120),s(body,400),safeLink(link)).run();return true}catch{return false}}
+async function notifyAdmin(env,type,title,body,link){try{await env.DB.prepare('INSERT INTO notifications(for_admin,type,title,body,link) VALUES(1,?,?,?,?)').bind(type,s(title,120),s(body,400),safeLink(link)).run()}catch{}}
+async function notifyEmail(env,email,type,title,body,link){try{const u=await env.DB.prepare("SELECT id FROM users WHERE email=? AND status='active'").bind(String(email||'').toLowerCase()).first();if(u)await notify(env,u.id,type,title,body,link)}catch{}}
+async function notifyApplicant(env,appId,status){try{const a=await env.DB.prepare('SELECT a.email,a.reference,j.title FROM applications a JOIN jobs j ON j.id=a.job_id WHERE a.id=?').bind(appId).first();if(a)await notifyEmail(env,a.email,'application_updates','Application status updated',`Your application for ${a.title} is now: ${status}.`,'#/application/'+a.reference)}catch{}}
+async function notifyCv(env,reqId,status){try{const a=await env.DB.prepare('SELECT email,reference,package_name FROM cv_service_requests WHERE id=?').bind(reqId).first();if(a)await notifyEmail(env,a.email,'service_updates','CV order updated',`Your ${a.package_name} order (${a.reference}) is now: ${status}.`,'#/profile/cvreq')}catch{}}
+const userOut=r=>({id:r.id??r.uid,email:r.email,name:r.name,picture:r.picture,photo:r.photo_key?'/media/'+r.photo_key:null,role:r.role});
+async function meBundle(env,uid,role){
+ const[prof,per,set,un]=await Promise.all([env.DB.prepare(`SELECT * FROM ${PT[role]} WHERE user_id=?`).bind(uid).first(),env.DB.prepare('SELECT * FROM user_personal WHERE user_id=?').bind(uid).first(),env.DB.prepare('SELECT data FROM user_settings WHERE user_id=?').bind(uid).first(),env.DB.prepare('SELECT COUNT(*) n FROM notifications WHERE user_id=? AND read_at IS NULL').bind(uid).first()]);
+ let st={};try{st=JSON.parse(set?.data||'{}')}catch{}
+ return{profile:prof,personal:per,settings:st,unread:un.n}}
+
 async function account(req,env,url,seg,M){
  const a=seg[1],b=seg[2],id=parseInt(seg[3]);
  if(a==='auth'){
@@ -639,25 +716,36 @@ async function account(req,env,url,seg,M){
    if(!env.GOOGLE_CLIENT_ID)return fail('Google sign-in is not configured yet.',503);
    const g=await googleVerify(env,String(bd.credential||''));if(!g)return fail('Google sign-in could not be verified. Please try again.',401);
    let u=await env.DB.prepare('SELECT * FROM users WHERE google_sub=? OR email=?').bind(g.sub,g.email).first();
+   let relinked=false;
+   if(!u){ // an approved change-email request: signing in with the NEW (Google-verified) email completes it and keeps the same account
+    const rq=await env.DB.prepare("SELECT id,user_id FROM email_change_requests WHERE new_email=? AND status='Approved' AND applied_at IS NULL ORDER BY id DESC LIMIT 1").bind(g.email).first();
+    if(rq){const ow=await env.DB.prepare('SELECT * FROM users WHERE id=?').bind(rq.user_id).first();
+     if(ow&&ow.status==='active'){await env.DB.batch([env.DB.prepare('UPDATE users SET google_sub=?,email=?,name=?,picture=?,last_login_at=CURRENT_TIMESTAMP WHERE id=?').bind(g.sub,g.email,g.name,g.picture,ow.id),env.DB.prepare('UPDATE email_change_requests SET applied_at=CURRENT_TIMESTAMP WHERE id=?').bind(rq.id),env.DB.prepare('DELETE FROM user_sessions WHERE user_id=?').bind(ow.id)]);
+      u={...ow,email:g.email};relinked=true;await notify(env,ow.id,'account_security','Email address changed','Your account email is now '+g.email+'. All other devices were signed out.','#/profile')}}}
    if(!u){const role=bd.role;if(role!=='job_seeker'&&role!=='employer')return json({needs_role:true,preview:{name:g.name,email:g.email,picture:g.picture}});
-    const r=await env.DB.prepare('INSERT INTO users(google_sub,email,name,picture,role) VALUES(?,?,?,?,?)').bind(g.sub,g.email,g.name,g.picture,role).run(),uid=r.meta.last_row_id;
-    await (role==='employer'?env.DB.prepare('INSERT INTO employer_profiles(user_id,email) VALUES(?,?)').bind(uid,g.email):env.DB.prepare('INSERT INTO job_seeker_profiles(user_id,first_name,last_name) VALUES(?,?,?)').bind(uid,g.given,g.family)).run();
-    u={id:uid,role,status:'active'}}
-   else{if(u.status!=='active')return fail('This account is not active. Please contact support.',403);
+    try{const r=await env.DB.prepare('INSERT INTO users(google_sub,email,name,picture,role) VALUES(?,?,?,?,?)').bind(g.sub,g.email,g.name,g.picture,role).run(),uid=r.meta.last_row_id;
+     await (role==='employer'?env.DB.prepare('INSERT OR IGNORE INTO employer_profiles(user_id,email) VALUES(?,?)').bind(uid,g.email):env.DB.prepare('INSERT OR IGNORE INTO job_seeker_profiles(user_id,first_name,last_name) VALUES(?,?,?)').bind(uid,g.given,g.family)).run();
+     await env.DB.prepare('INSERT OR IGNORE INTO user_personal(user_id,first_name,last_name,full_name) VALUES(?,?,?,?)').bind(uid,g.given||null,g.family||null,g.name||null).run();
+     await notify(env,uid,'account_security','Welcome to M-RECRUITS','Your account has been created. Complete your profile to get started.','#/profile');await notifyAdmin(env,'registration','New '+(role==='employer'?'employer':'job seeker')+' registered',(g.name||'')+' ('+g.email+')','#/admin/usr');
+     u={id:uid,role,status:'active'}}
+    catch(e){const ex=await env.DB.prepare('SELECT * FROM users WHERE google_sub=? OR email=?').bind(g.sub,g.email).first();if(!ex)throw e;u=ex}}
+   else if(!relinked){if(u.status!=='active')return fail('This account is not active. Please contact support.',403);
     await env.DB.prepare('UPDATE users SET google_sub=?,name=?,picture=?,last_login_at=CURRENT_TIMESTAMP WHERE id=?').bind(g.sub,g.name,g.picture,u.id).run()}
+   if(u.status!=='active')return fail('This account is not active. Please contact support.',403);
+   await env.DB.prepare(`INSERT OR IGNORE INTO ${PT[u.role]}(user_id) VALUES(?)`).bind(u.id).run();await env.DB.prepare('INSERT OR IGNORE INTO user_personal(user_id) VALUES(?)').bind(u.id).run();
    const tok=rnd(32),csrf=rnd(16);
    await env.DB.batch([env.DB.prepare('INSERT INTO user_sessions(user_id,token_hash,csrf,expires_at) VALUES(?,?,?,?)').bind(u.id,await sha(tok),csrf,Date.now()+365*864e5),env.DB.prepare('INSERT INTO login_history(user_id,user_agent) VALUES(?,?)').bind(u.id,s(req.headers.get('user-agent'),200))]);
-   const prof=await env.DB.prepare(`SELECT * FROM ${PT[u.role]} WHERE user_id=?`).bind(u.id).first();
-   return json({user:{id:u.id,email:g.email,name:g.name,picture:g.picture,role:u.role},csrf,profile:prof},200,{'set-cookie':`mr_u=${tok}${CK}; Max-Age=31536000`,'cache-control':'no-store'})}
-  if((b==='logout'||b==='logout-all')&&M==='POST'){const u=await userAuth(req,env);if(u==='csrf')return fail('CSRF check failed',403);
+   const full=await env.DB.prepare('SELECT * FROM users WHERE id=?').bind(u.id).first(),mb=await meBundle(env,u.id,u.role);
+   return json({user:userOut(full),csrf,...mb},200,{'set-cookie':`mr_u=${tok}${CK}; Max-Age=31536000`,'cache-control':'no-store'})}
+  if((b==='logout'||b==='logout-all')&&M==='POST'){const u=await userAuth(req,env,true);
    if(u){if(b==='logout-all')await env.DB.prepare('DELETE FROM user_sessions WHERE user_id=?').bind(u.uid).run();else{const m=(req.headers.get('cookie')||'').match(/mr_u=([a-f0-9]{64})/);await env.DB.prepare('DELETE FROM user_sessions WHERE token_hash=?').bind(await sha(m[1])).run()}}
-   return json({ok:true},200,{'set-cookie':`mr_u=; Max-Age=0${CK}`})}
+   return json({ok:true},200,{'set-cookie':`mr_u=; Max-Age=0${CK}`,'cache-control':'no-store'})}
   return fail('Not found',404)}
  // /api/me...
  const u=await userAuth(req,env);if(u==='csrf')return fail('CSRF check failed',403);if(!u)return fail('Unauthorized',401);
  const NS={'cache-control':'no-store'};
- if(!b&&M==='GET'){const prof=await env.DB.prepare(`SELECT * FROM ${PT[u.role]} WHERE user_id=?`).bind(u.uid).first();let hd=NS;if(u.exp<Date.now()+300*864e5){const m=(req.headers.get('cookie')||'').match(/mr_u=([a-f0-9]{64})/);if(m){await env.DB.prepare('UPDATE user_sessions SET expires_at=? WHERE token_hash=?').bind(Date.now()+365*864e5,await sha(m[1])).run();hd={...NS,'set-cookie':`mr_u=${m[1]}${CK}; Max-Age=31536000`}}}
-  return json({user:{id:u.uid,email:u.email,name:u.name,picture:u.picture,role:u.role},csrf:u.csrf,profile:prof},200,hd)}
+ if(!b&&M==='GET'){const mb=await meBundle(env,u.uid,u.role);let hd=NS;if(u.exp<Date.now()+300*864e5){const m=(req.headers.get('cookie')||'').match(/mr_u=([a-f0-9]{64})/);if(m){await env.DB.prepare('UPDATE user_sessions SET expires_at=? WHERE token_hash=?').bind(Date.now()+365*864e5,await sha(m[1])).run();hd={...NS,'set-cookie':`mr_u=${m[1]}${CK}; Max-Age=31536000`}}}
+  return json({user:userOut(u),csrf:u.csrf,...mb},200,hd)}
  if(b==='history'&&M==='GET')return json((await env.DB.prepare('SELECT user_agent,created_at FROM login_history WHERE user_id=? ORDER BY id DESC LIMIT 20').bind(u.uid).all()).results,200,NS);
  if(b==='profile'&&M==='PATCH'){let bd;try{bd=await body(req)}catch{return fail('Invalid JSON')}
   const sets=[],p=[],bad=m=>fail(m,422);
@@ -671,6 +759,59 @@ async function account(req,env,url,seg,M){
   if(u.role==='job_seeker'&&Array.isArray(bd.skills)){sets.push('skills=?');p.push(JSON.stringify(bd.skills.map(x=>s(x,60)).filter(Boolean).slice(0,40)))}
   if(!sets.length)return bad('Nothing to update');
   await env.DB.prepare(`UPDATE ${PT[u.role]} SET ${sets.join(',')},updated_at=CURRENT_TIMESTAMP WHERE user_id=?`).bind(...p,u.uid).run();return json({ok:true})}
+
+ if(b==='personal'&&M==='PATCH'){let bd;try{bd=await body(req)}catch{return fail('Invalid JSON')}
+  const F=['username','first_name','middle_name','last_name','phone','gender','dob','country','state','city','address','bio','language'],sets=[],p=[],bad=m=>fail(m,422);
+  for(const k of F){if(!(k in bd))continue;let v=s(bd[k],k==='bio'?500:k==='address'?300:100);
+   if(k==='username'){v=v.toLowerCase();if(v&&!/^[a-z0-9_]{3,30}$/.test(v))return bad('Username must be 3 to 30 letters, numbers or underscores.')}
+   if(k==='phone'&&v&&!/^\+?[0-9 ()-]{7,20}$/.test(v))return bad('Enter a valid phone number.');
+   if(k==='gender'&&v&&!['Male','Female','Other','Prefer not to say'].includes(v))return bad('Choose a valid option for gender.');
+   if(k==='language'&&v&&!LANGS.includes(v))return bad('Choose a valid language.');
+   if(k==='dob'&&v&&(!/^\d{4}-\d{2}-\d{2}$/.test(v)||v>new Date().toISOString().slice(0,10)||v<'1900-01-01'))return bad('Enter a valid date of birth.');
+   sets.push(k+'=?');p.push(v===''?null:v)}
+  if(!sets.length)return bad('Nothing to update.');
+  await env.DB.prepare('INSERT OR IGNORE INTO user_personal(user_id) VALUES(?)').bind(u.uid).run();
+  const cur=await env.DB.prepare('SELECT * FROM user_personal WHERE user_id=?').bind(u.uid).first()||{},m={...cur};sets.forEach((x,i)=>{m[x.slice(0,-2)]=p[i]});
+  sets.push('full_name=?');p.push([m.first_name,m.middle_name,m.last_name].filter(Boolean).join(' ')||null);
+  if('phone' in bd&&String(bd.phone||'').trim()!==String(cur.phone||'')){sets.push('phone_verified=?');p.push(0)} // a changed number is never treated as verified
+  try{await env.DB.prepare(`UPDATE user_personal SET ${sets.join(',')},updated_at=CURRENT_TIMESTAMP WHERE user_id=?`).bind(...p,u.uid).run()}catch(e){if(/UNIQUE/i.test(String(e.message)))return fail('That username is already taken.',409);throw e}
+  return json({ok:true})}
+ if(b==='photo'&&M==='POST'){
+  if(!(await limit(env,'ph:'+u.uid,10,3600)))return fail('Too many uploads. Please try again later.',429);
+  if(+req.headers.get('content-length')>3*1024*1024)return fail('The image is too large. Please choose one under 2 MB.',413);
+  const f=await req.formData(),file=f.get('file');if(!(file instanceof File)||!file.size||file.size>2*1024*1024)return fail('Please choose an image under 2 MB.',422);
+  const e=await sniff(file,['png','jpg','webp']);if(!e)return fail('Please upload a PNG, JPEG or WebP image.',422);
+  const key=`public/avatar/${rnd(12)}.${e}`,old=(await env.DB.prepare('SELECT photo_key FROM users WHERE id=?').bind(u.uid).first())?.photo_key;
+  await env.MEDIA_BUCKET.put(key,file.stream(),{httpMetadata:{contentType:MT[e]}});await env.DB.prepare('UPDATE users SET photo_key=? WHERE id=?').bind(key,u.uid).run();
+  if(old)try{await env.MEDIA_BUCKET.delete(old)}catch{}
+  return json({photo:'/media/'+key})}
+ if(b==='photo'&&M==='DELETE'){const old=(await env.DB.prepare('SELECT photo_key FROM users WHERE id=?').bind(u.uid).first())?.photo_key;await env.DB.prepare('UPDATE users SET photo_key=NULL WHERE id=?').bind(u.uid).run();if(old)try{await env.MEDIA_BUCKET.delete(old)}catch{}return json({ok:true})}
+ if(b==='settings'&&(M==='PUT'||M==='PATCH')){let bd;try{bd=await body(req)}catch{return fail('Invalid JSON')}
+  const row=await env.DB.prepare('SELECT data FROM user_settings WHERE user_id=?').bind(u.uid).first();let cur={};try{cur=JSON.parse(row?.data||'{}')}catch{}
+  if('theme' in bd){if(!THEMES.includes(bd.theme))return fail('Choose a valid theme.',422);cur.theme=bd.theme}
+  if('font_size' in bd){if(!FSIZES.includes(bd.font_size))return fail('Choose a valid font size.',422);cur.font_size=bd.font_size}
+  if('font_family' in bd){if(!FFAM.includes(bd.font_family))return fail('Choose a valid font.',422);cur.font_family=bd.font_family}
+  if(bd.notify&&typeof bd.notify==='object'){cur.notify={...(cur.notify||{})};for(const k of NTYPES)if(k in bd.notify)cur.notify[k]=!!bd.notify[k]}
+  await env.DB.prepare('INSERT INTO user_settings(user_id,data) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET data=excluded.data,updated_at=CURRENT_TIMESTAMP').bind(u.uid,JSON.stringify(cur)).run();
+  return json({settings:cur})}
+ if(b==='notifications'){
+  const cnt=async()=>(await env.DB.prepare('SELECT COUNT(*) n FROM notifications WHERE user_id=? AND read_at IS NULL').bind(u.uid).first()).n;
+  if(M==='GET'&&seg[3]==='unread')return json({count:await cnt()},200,NS);
+  if(M==='GET'&&!seg[3]){const page=Math.max(1,parseInt(url.searchParams.get('page'))||1);return json({notifications:(await env.DB.prepare('SELECT id,type,title,body,link,read_at,created_at FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 30 OFFSET ?').bind(u.uid,(page-1)*30).all()).results,unread:await cnt(),page},200,NS)}
+  if(M==='POST'&&seg[3]==='read'){let bd;try{bd=await body(req)}catch{return fail('Invalid JSON')}
+   if(bd.all)await env.DB.prepare('UPDATE notifications SET read_at=CURRENT_TIMESTAMP WHERE user_id=? AND read_at IS NULL').bind(u.uid).run();
+   else{const ids=(Array.isArray(bd.ids)?bd.ids:[]).map(Number).filter(n=>Number.isInteger(n)&&n>0).slice(0,50);if(ids.length)await env.DB.prepare('UPDATE notifications SET read_at=CURRENT_TIMESTAMP WHERE user_id=? AND read_at IS NULL AND id IN (SELECT value FROM json_each(?))').bind(u.uid,JSON.stringify(ids)).run()}
+   return json({count:await cnt()},200,NS)}}
+ if(b==='email-change'){
+  if(M==='GET')return json((await env.DB.prepare('SELECT id,new_email,status,admin_note,created_at,decided_at,applied_at FROM email_change_requests WHERE user_id=? ORDER BY id DESC LIMIT 10').bind(u.uid).all()).results,200,NS);
+  if(M==='POST'){let bd;try{bd=await body(req)}catch{return fail('Invalid JSON')}
+   const ne=s(bd.new_email,254).toLowerCase();if(!emailOk(ne))return fail('Enter a valid email address.',422);
+   if(ne===String(u.email).toLowerCase())return fail('That is already your account email.',422);
+   if(await env.DB.prepare('SELECT 1 FROM users WHERE email=?').bind(ne).first())return fail('That email address is already used by another account.',409);
+   if(await env.DB.prepare("SELECT 1 FROM email_change_requests WHERE user_id=? AND status='Pending'").bind(u.uid).first())return fail('You already have a pending request. Please wait for it to be reviewed.',409);
+   if(!(await limit(env,'ec:'+u.uid,3,86400)))return fail('You can send a few email change requests per day. Please try again tomorrow.',429);
+   await env.DB.prepare('INSERT INTO email_change_requests(user_id,new_email,reason) VALUES(?,?,?)').bind(u.uid,ne,s(bd.reason,300)||null).run();
+   await notifyAdmin(env,'email_change','Change email request',(u.name||u.email)+' asked to change email to '+ne,'#/admin/em');return json({ok:true},201)}}
  const L=LISTS[b];
  if(L&&u.role==='job_seeker'){
   if(M==='GET'&&!id)return json((await env.DB.prepare(`SELECT * FROM ${L.t} WHERE user_id=? ORDER BY COALESCE(end_date,'9999') DESC,id DESC`).bind(u.uid).all()).results,200,NS);
@@ -692,7 +833,7 @@ export default{async fetch(req,env){
  if(!path.startsWith('/api/')&&!path.startsWith('/media/'))return env.ASSETS.fetch(req);
  if(path==='/api/health'&&req.method==='GET'){ // shows which Worker version is live and whether the database is healthy
   let err=null;try{await ensureDb(env)}catch(e){err=e}
-  const out={worker_schema_version:SCHEMA_VERSION,database:err?'error':'ok'};
+  const out={worker_schema_version:SCHEMA_VERSION,database:err?'error':'ok',google_signin_configured:!!env.GOOGLE_CLIENT_ID};
   if(env.ADMIN_BOOTSTRAP_SECRET&&url.searchParams.get('key')===env.ADMIN_BOOTSTRAP_SECRET){ // details only with your ADMIN_BOOTSTRAP_SECRET
    out.error=err?clean(err.message):null;
    try{out.recorded_version=(await env.DB.prepare('SELECT MAX(version) v FROM schema_migrations').first())?.v??null}catch{out.recorded_version='none'}
@@ -755,7 +896,7 @@ async function route(req,env,url,path){
  if(M==='POST'&&path==='/api/service-requests')return simpleInsert(req,env,'service_requests',[['full_name','req'],['email','email'],['phone','req',30],['message','',2000],['company','',200],['location','req',200],['service_id','int']],'SR',async(v,e)=>{const x=await e.DB.prepare('SELECT id FROM services WHERE id=? AND active=1').bind(v.service_id).first();return x?{}:null});
  if(M==='POST'&&path==='/api/contact')return(async()=>{if(!(await limit(env,'ct:'+ip(req),5,3600)))return fail('Too many requests',429);let b;try{b=await body(req)}catch{return fail('Invalid JSON')}
   if(!s(b.name)||!emailOk(s(b.email))||!s(b.message))return fail('Name, valid email and message required',422);
-  await env.DB.prepare('INSERT INTO contact_messages(name,email,subject,message) VALUES(?,?,?,?)').bind(s(b.name),s(b.email),s(b.subject),s(b.message,3000)).run();return json({ok:true},201)})();
+  await env.DB.prepare('INSERT INTO contact_messages(name,email,subject,message) VALUES(?,?,?,?)').bind(s(b.name),s(b.email),s(b.subject),s(b.message,3000)).run();await notifyAdmin(env,'support','New contact message',s(b.name,60)+' - '+s(b.subject,60),'#/admin/dash');return json({ok:true},201)})();
  return fail('Not found',404)}
 
 // ---------- admin ----------
@@ -788,7 +929,7 @@ async function admin(req,env,url,seg,M){
  const id=parseInt(seg[3]);
  if(a==='logout'&&M==='POST'){const m=req.headers.get('cookie').match(/mr_s=([a-f0-9]{64})/);await env.DB.prepare('DELETE FROM admin_sessions WHERE token_hash=?').bind(await sha(m[1])).run();return json({ok:true},200,{'set-cookie':'mr_s=; Max-Age=0; Path=/api/admin; HttpOnly; Secure'})}
  if(a==='me')return json({email:au.email,role:au.role,csrf:au.csrf});
- if(a==='overview'){const r=await env.DB.prepare("SELECT (SELECT COUNT(*) FROM applications) applications,(SELECT COUNT(*) FROM jobs WHERE status='published') published,(SELECT COUNT(*) FROM jobs WHERE status='draft') drafts,(SELECT COUNT(*) FROM service_requests) service_requests,(SELECT COUNT(*) FROM employer_inquiries) inquiries").first();
+ if(a==='overview'){const r=await env.DB.prepare("SELECT (SELECT COUNT(*) FROM users) users_total,(SELECT COUNT(*) FROM users WHERE role='job_seeker') job_seekers,(SELECT COUNT(*) FROM users WHERE role='employer') employers,(SELECT COUNT(*) FROM employer_profiles WHERE verification_status='Verified') verified_employers,(SELECT COUNT(*) FROM employer_profiles WHERE verification_status IN ('Pending Review','More Information Required')) pending_verification,(SELECT COUNT(*) FROM jobs) jobs_total,(SELECT COUNT(*) FROM jobs WHERE status='published') published,(SELECT COUNT(*) FROM jobs WHERE status='draft') drafts,(SELECT COUNT(*) FROM jobs WHERE status IN ('filled','expired')) jobs_closed,(SELECT COUNT(*) FROM applications) applications,(SELECT COUNT(*) FROM applications WHERE status='Pending') applications_pending,(SELECT COUNT(*) FROM cv_service_requests) cv_orders,(SELECT COUNT(*) FROM service_requests) service_requests,(SELECT COUNT(*) FROM employer_inquiries) inquiries,(SELECT COUNT(*) FROM email_change_requests WHERE status='Pending') email_requests").first();
   const by=await env.DB.prepare('SELECT status,COUNT(*) n FROM applications GROUP BY status').all();return json({...r,applications_by_status:by.results})}
  if(a==='jobs'){
   if(M==='GET')return json((await env.DB.prepare('SELECT * FROM jobs ORDER BY updated_at DESC LIMIT 200').all()).results);
@@ -815,7 +956,7 @@ async function admin(req,env,url,seg,M){
    const n=await env.DB.prepare('SELECT note,created_at FROM application_notes WHERE application_id=? ORDER BY id DESC').bind(id).all();return json({...x,notes:n.results})}
   let b;try{b=await body(req)}catch{return fail('Invalid JSON')}
   if(M==='PATCH'){const ok=['Pending','Under Review','Shortlisted','Interview Scheduled','Accepted','Rejected'];if(!ok.includes(b.status))return fail('Invalid status',422);
-   await env.DB.prepare('UPDATE applications SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').bind(b.status,id).run();await audit(env,req,au,'application.status','applications',id);return json({ok:true})}
+   await env.DB.prepare('UPDATE applications SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').bind(b.status,id).run();await audit(env,req,au,'application.status','applications',id);await notifyApplicant(env,id,b.status);return json({ok:true})}
   if(M==='POST'&&seg[4]==='notes'){if(!s(b.note,2000))return fail('Note required',422);await env.DB.prepare('INSERT INTO application_notes(application_id,admin_id,note) VALUES(?,?,?)').bind(id,au.uid,s(b.note,2000)).run();return json({ok:true},201)}}
  if(a==='cvfile'&&M==='GET'){const k=url.searchParams.get('k')||'',e=+url.searchParams.get('e'),sg=url.searchParams.get('sig')||'';
   if(!/^private\/cv(-pay|-old|-done)?\//.test(k)||e<Date.now()||sg!==await hmac(env,k+e))return fail('Link invalid or expired',403);
@@ -911,7 +1052,7 @@ async function admin(req,env,url,seg,M){
    return json({url:`/api/admin/cvfile?k=${encodeURIComponent(k)}&e=${exp}&sig=${sig}`})}
   if(M==='PATCH'){let b;try{b=await body(req)}catch{return fail('Invalid JSON')}const okS=['Payment Pending','Payment Under Review','Payment Approved','Payment Rejected','In Progress','Completed'],sets=[],p=[];
    if('status' in b){if(!okS.includes(b.status))return fail('Invalid status',422);sets.push('status=?');p.push(b.status)}if('admin_notes' in b){sets.push('admin_notes=?');p.push(s(b.admin_notes,2000))}
-   if(!sets.length)return fail('Nothing to update',422);await env.DB.prepare(`UPDATE cv_service_requests SET ${sets.join(',')},updated_at=CURRENT_TIMESTAMP WHERE id=?`).bind(...p,id).run();await audit(env,req,au,'cv.update','cv_service_requests',id);return json({ok:true})}
+   if(!sets.length)return fail('Nothing to update',422);await env.DB.prepare(`UPDATE cv_service_requests SET ${sets.join(',')},updated_at=CURRENT_TIMESTAMP WHERE id=?`).bind(...p,id).run();await audit(env,req,au,'cv.update','cv_service_requests',id);if(b.status)await notifyCv(env,id,b.status);return json({ok:true})}
   if(M==='POST'&&seg[4]==='deliver'){
    if(+req.headers.get('content-length')>7*1024*1024)return fail('File too large',413);
    const x=await env.DB.prepare('SELECT reference,status FROM cv_service_requests WHERE id=?').bind(id).first();if(!x)return fail('Not found',404);
@@ -920,11 +1061,55 @@ async function admin(req,env,url,seg,M){
    const key=`private/cv-done/${x.reference}-${rnd(6)}.pdf`,name=(file.name||'CV.pdf').slice(0,120),msg=s(f.get('message'),1000);
    await env.MEDIA_BUCKET.put(key,file.stream(),{httpMetadata:{contentType:'application/pdf'}});
    await env.DB.batch([env.DB.prepare('INSERT INTO cv_deliveries(request_id,file_key,file_name,message,delivered_by) VALUES(?,?,?,?,?)').bind(id,key,name,msg,au.uid),env.DB.prepare("UPDATE cv_service_requests SET final_key=?,final_name=?,delivery_message=?,delivered_at=CURRENT_TIMESTAMP,status='Delivered',updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(key,name,msg,id)]);
-   await audit(env,req,au,'cv.deliver','cv_service_requests',id);return json({ok:true})}}
+   await audit(env,req,au,'cv.deliver','cv_service_requests',id);await notifyCv(env,id,'Delivered');return json({ok:true})}}
 
  if(a==='error-logs'&&M==='GET'){const q=url.searchParams,w=['1=1'],p=[],c=s(q.get('category'),30),kw=s(q.get('q'),40);
   if(c){w.push('category=?');p.push(c)}if(kw){w.push('(ref LIKE ? OR module LIKE ?)');const l=`%${kw.replace(/[%_]/g,'')}%`;p.push(l,l)}
   const page=Math.max(1,parseInt(q.get('page'))||1);
   return json({logs:(await env.DB.prepare(`SELECT ref,category,module,method,status,summary,created_at FROM error_logs WHERE ${w.join(' AND ')} ORDER BY id DESC LIMIT 50 OFFSET ?`).bind(...p,(page-1)*50).all()).results,page})}
+
+ if(a==='users'){
+  if(M==='GET'&&!id){const q=url.searchParams,w=['1=1'],p=[],role=s(q.get('role'),20),st=s(q.get('status'),20),kw=s(q.get('q'),60);
+   if(['job_seeker','employer'].includes(role)){w.push('u.role=?');p.push(role)}if(['active','suspended'].includes(st)){w.push('u.status=?');p.push(st)}
+   if(kw){w.push("(u.email LIKE ? ESCAPE '\\' OR u.name LIKE ? ESCAPE '\\' OR pe.username LIKE ? ESCAPE '\\')");const l='%'+kw.replace(/[\\%_]/g,'\\$&')+'%';p.push(l,l,l)}
+   const page=Math.max(1,parseInt(q.get('page'))||1);
+   return json({users:(await env.DB.prepare(`SELECT u.id,u.email,u.name,u.role,u.status,u.created_at,u.last_login_at,pe.username FROM users u LEFT JOIN user_personal pe ON pe.user_id=u.id WHERE ${w.join(' AND ')} ORDER BY u.id DESC LIMIT 25 OFFSET ?`).bind(...p,(page-1)*25).all()).results,page})}
+  if(!id)return fail('id required',422);
+  if(M==='GET'){const x=await env.DB.prepare('SELECT id,email,name,picture,photo_key,role,status,created_at,last_login_at FROM users WHERE id=?').bind(id).first();if(!x)return fail('Not found',404);
+   const[per,prof,hist,er]=await Promise.all([env.DB.prepare('SELECT username,first_name,middle_name,last_name,full_name,phone,phone_verified,gender,country,state,city,language FROM user_personal WHERE user_id=?').bind(id).first(),env.DB.prepare(`SELECT * FROM ${PT[x.role]} WHERE user_id=?`).bind(id).first(),env.DB.prepare('SELECT user_agent,created_at FROM login_history WHERE user_id=? ORDER BY id DESC LIMIT 10').bind(id).all(),env.DB.prepare('SELECT id,new_email,status,created_at FROM email_change_requests WHERE user_id=? ORDER BY id DESC LIMIT 5').bind(id).all()]);
+   return json({user:{...userOut(x),status:x.status,created_at:x.created_at,last_login_at:x.last_login_at},personal:per,profile:prof,history:hist.results,email_requests:er.results})}
+  if(M==='PATCH'){let b;try{b=await body(req)}catch{return fail('Invalid JSON')}
+   if(!['active','suspended'].includes(b.status))return fail('Invalid status',422);
+   if(!await env.DB.prepare('SELECT 1 FROM users WHERE id=?').bind(id).first())return fail('Not found',404);
+   await env.DB.prepare('UPDATE users SET status=? WHERE id=?').bind(b.status,id).run();
+   if(b.status==='suspended')await env.DB.prepare('DELETE FROM user_sessions WHERE user_id=?').bind(id).run();else await notify(env,id,'account_security','Account restored','Your account is active again.','#/profile');
+   await audit(env,req,au,'user.'+b.status,'users',id);return json({ok:true})}}
+ if(a==='email-requests'){
+  if(M==='GET'&&!id){const st=s(url.searchParams.get('status'),20);
+   return json((await env.DB.prepare(`SELECT r.id,r.new_email,r.reason,r.status,r.admin_note,r.created_at,r.decided_at,r.applied_at,u.email current_email,u.name FROM email_change_requests r JOIN users u ON u.id=r.user_id ${st?'WHERE r.status=?':''} ORDER BY r.id DESC LIMIT 50`).bind(...(st?[st]:[])).all()).results)}
+  if(M==='PATCH'&&id){let b;try{b=await body(req)}catch{return fail('Invalid JSON')}
+   if(!['Approved','Rejected'].includes(b.status))return fail('Invalid decision',422);
+   const r=await env.DB.prepare('SELECT * FROM email_change_requests WHERE id=?').bind(id).first();if(!r)return fail('Not found',404);
+   if(r.status!=='Pending')return fail('This request has already been decided.',409);
+   if(b.status==='Approved'&&await env.DB.prepare('SELECT 1 FROM users WHERE email=?').bind(r.new_email).first())return fail('That email address is now used by another account.',409);
+   await env.DB.prepare('UPDATE email_change_requests SET status=?,admin_note=?,decided_at=CURRENT_TIMESTAMP,decided_by=? WHERE id=?').bind(b.status,s(b.admin_note,300)||null,au.uid,id).run();
+   await notify(env,r.user_id,'account_security',b.status==='Approved'?'Email change approved':'Email change not approved',b.status==='Approved'?'To finish, sign out and sign in with Google using '+r.new_email+'. Your account and records will stay the same.':('Your request was not approved.'+(b.admin_note?' Reason: '+s(b.admin_note,200):'')),'#/profile');
+   await audit(env,req,au,'email_change.'+b.status.toLowerCase(),'email_change_requests',id);return json({ok:true})}}
+ if(a==='announcements'){
+  if(M==='GET')return json((await env.DB.prepare('SELECT id,title,body,audience,link,recipients,created_at FROM announcements ORDER BY id DESC LIMIT 50').all()).results);
+  if(M==='POST'){let b;try{b=await body(req)}catch{return fail('Invalid JSON')}
+   const title=s(b.title,120),text=s(b.body,800),aud=s(b.audience,20),link=s(b.link,200)?safeLink(s(b.link,200)):null;
+   if(!title||!text)return fail('Please enter a title and a message.',422);if(!['all','job_seeker','employer'].includes(aud))return fail('Choose who should receive it.',422);
+   if(s(b.link,200)&&!link)return fail('The link must be an in-app link such as #/jobs.',422);
+   const r=await env.DB.prepare("INSERT INTO notifications(user_id,type,title,body,link) SELECT u.id,'announcements',?,?,? FROM users u LEFT JOIN user_settings st ON st.user_id=u.id WHERE u.status='active' AND (?='all' OR u.role=?) AND COALESCE(json_extract(st.data,'$.notify.announcements'),1)!=0").bind(title,text,link,aud,aud).run();
+   await env.DB.prepare('INSERT INTO announcements(title,body,audience,link,recipients,created_by) VALUES(?,?,?,?,?,?)').bind(title,text,aud,link,r.meta.changes,au.uid).run();
+   await audit(env,req,au,'announcement.send','announcements',aud);return json({recipients:r.meta.changes},201)}}
+ if(a==='notifications'){
+  const un=async()=>(await env.DB.prepare('SELECT COUNT(*) n FROM notifications WHERE for_admin=1 AND read_at IS NULL').first()).n;
+  if(M==='GET')return json({notifications:(await env.DB.prepare('SELECT id,type,title,body,link,read_at,created_at FROM notifications WHERE for_admin=1 ORDER BY id DESC LIMIT 50').all()).results,unread:await un()});
+  if(M==='POST'&&seg[3]==='read'){let b;try{b=await body(req)}catch{return fail('Invalid JSON')}
+   if(b.all)await env.DB.prepare('UPDATE notifications SET read_at=CURRENT_TIMESTAMP WHERE for_admin=1 AND read_at IS NULL').run();
+   else{const ids=(Array.isArray(b.ids)?b.ids:[]).map(Number).filter(n=>Number.isInteger(n)&&n>0).slice(0,50);if(ids.length)await env.DB.prepare('UPDATE notifications SET read_at=CURRENT_TIMESTAMP WHERE for_admin=1 AND read_at IS NULL AND id IN (SELECT value FROM json_each(?))').bind(JSON.stringify(ids)).run()}
+   return json({unread:await un()})}}
 
  return fail('Not found',404)}
